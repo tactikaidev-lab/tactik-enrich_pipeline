@@ -24,9 +24,10 @@ VERIFIED SOURCE STATS (checked directly against the uploaded files)
   Bali WhatsApp     : 138 contacts (39 named + 99 phone-only) — hardest, no company/site
 
 REQUIRED ENV VARS (set at `docker run` time via --env-file, never baked into the image)
-  HUNTER_API_KEY
-  APOLLO_API_KEY
-  PDL_API_KEY
+  HUNTER_API_KEY       (vsbn/transcend only — if unset, falls back to free site
+                        scraping instead of erroring; see DESIGN NOTES below)
+  APOLLO_API_KEY       (bali only)
+  PDL_API_KEY          (bali only)
   AIRTABLE_API_KEY     (only needed if --airtable-push is used)
   AIRTABLE_BASE_ID     (only needed if --airtable-push is used)
 
@@ -45,16 +46,26 @@ USAGE
 DESIGN NOTES
   - Every API call is cached to a local sqlite db (enrich_cache.db), keyed by lookup
     key, so re-runs never pay twice for the same lookup.
-  - Hunter's email VERIFIER always runs on any email before it's accepted.
+  - Hunter's email VERIFIER always runs on any Hunter-found email before it's accepted.
   - Known-blocked approaches (LinkedIn scraping, search-engine scraping, free
     reverse-phone lookup) are deliberately NOT implemented — already tried and
     failed from the server IP, per the brief.
+  - Free fallback: if HUNTER_API_KEY isn't set, enrich_domain_based (vsbn/transcend)
+    scrapes the LEAD'S OWN public site (homepage + /contact, /about style pages) for
+    a listed email instead of calling Hunter. This is scoped to the lead's own
+    domain only — it is NOT the LinkedIn/search-engine scraping ruled out above.
+    Lower confidence than Hunter: no pattern-matching, and verification is an MX
+    lookup (domain can receive mail) rather than Hunter's real mailbox check. Every
+    row enriched this way gets a note in `_enrichment_notes` saying so, so it's
+    flagged for review rather than silently trusted the same as a Hunter result.
+    Once HUNTER_API_KEY is set, this fallback stops being used automatically.
 """
 
 import argparse
 import csv
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -67,8 +78,13 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install requests openpyxl --break-system-packages")
 
+try:
+    import dns.resolver as _dns_resolver  # optional — only used for the free-scrape MX check
+except ImportError:
+    _dns_resolver = None
+
 CACHE_DB = "enrich_cache.db"
-RATE_LIMIT_SECONDS = {"hunter": 1.0, "apollo": 1.0, "pdl": 1.0, "airtable": 0.25}
+RATE_LIMIT_SECONDS = {"hunter": 1.0, "apollo": 1.0, "pdl": 1.0, "airtable": 0.25, "scrape": 1.5}
 
 TARGET_FIELDS = [
     "first_name", "last_name", "business_name", "phone", "email",
@@ -242,6 +258,109 @@ def pdl_enrich_phone(conn, phone, dry_run=False):
         "linkedin": data.get("linkedin_url"),
     }
     cache_set(conn, "pdl", phone, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Free scrape fallback — used by enrich_domain_based ONLY when HUNTER_API_KEY
+# isn't set. Scoped to the lead's own domain (its homepage / contact / about
+# pages), never a third party — that's a different thing from the LinkedIn /
+# search-engine scraping already ruled out per the brief (see module docstring).
+# No API key required, so this stays safe to call with zero keys configured.
+# ---------------------------------------------------------------------------
+
+_SCRAPE_PATHS = ("", "contact", "contact-us", "about", "about-us")
+_SCRAPE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TactikLeadEnrichment/1.0; +free-scrape-fallback)"}
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_JUNK_DOMAINS = {"example.com", "sentry.io", "wixpress.com", "godaddy.com", "schema.org",
+                  "w3.org", "cloudflare.com", "wordpress.com", "gravatar.com"}
+_JUNK_LOCALPARTS = {"noreply", "no-reply", "donotreply", "do-not-reply", "webmaster",
+                     "postmaster", "yourname", "example", "test"}
+# Some leads' `website` field is actually a social/profile-page link, not their own
+# site. Scraping those isn't "the lead's own site" any more — it's the platform —
+# and edges toward the search-engine/social scraping already ruled out per the
+# brief, so these are skipped outright rather than fetched.
+_SOCIAL_PLATFORM_DOMAINS = {
+    "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
+    "youtube.com", "tiktok.com", "linktr.ee", "wa.me", "m.me", "maps.google.com",
+    "g.page", "yelp.com",
+}
+
+
+def _is_social_platform(domain):
+    bare = domain.split(":")[0].lower()
+    parts = bare.split(".")
+    return any(bare == d or bare.endswith("." + d) for d in _SOCIAL_PLATFORM_DOMAINS) or len(parts) < 2
+
+
+def _scrape_site_emails(domain):
+    """Fetch a handful of public pages on the lead's own site and pull out any
+    emails found in the raw HTML (mailto: links included, via the same regex)."""
+    if _is_social_platform(domain):
+        return set()
+    found = set()
+    for path in _SCRAPE_PATHS:
+        for scheme in ("https://", "http://"):
+            url = f"{scheme}{domain}/{path}"
+            try:
+                resp = requests.get(url, headers=_SCRAPE_HEADERS, timeout=8)
+            except requests.RequestException:
+                continue
+            if resp.ok:
+                found.update(m.lower() for m in EMAIL_RE.findall(resp.text))
+                break  # got a response for this path, no need to also try the other scheme
+        if found:
+            break  # already have candidates, don't keep hammering more pages
+    return found
+
+
+def _pick_best_email(candidates, domain, first_name, last_name):
+    bare_domain = domain.split(":")[0].lower()
+    on_domain = [
+        e for e in candidates
+        if e.split("@", 1)[1] == bare_domain
+        and e.split("@", 1)[0] not in _JUNK_LOCALPARTS
+        and e.split("@", 1)[1] not in _JUNK_DOMAINS
+    ]
+    if not on_domain:
+        return None
+    fn, ln = (first_name or "").lower(), (last_name or "").lower()
+    for e in on_domain:
+        local = e.split("@", 1)[0]
+        if (fn and fn in local) or (ln and ln in local):
+            return e
+    for role in ("info", "contact", "hello", "enquiries", "sales", "admin"):
+        for e in on_domain:
+            if e.split("@", 1)[0] == role:
+                return e
+    return sorted(on_domain)[0]
+
+
+def _domain_has_mx(domain):
+    """Best-effort MX check — confirms the domain CAN receive mail. This is not a
+    mailbox verification like Hunter's verifier, just a sanity check for the free
+    fallback. Returns None (not False) if dnspython isn't installed, so callers can
+    tell 'checked and failed' apart from 'couldn't check'."""
+    if _dns_resolver is None:
+        return None
+    try:
+        return len(_dns_resolver.resolve(domain, "MX", lifetime=5)) > 0
+    except Exception:
+        return False
+
+
+def scrape_find_email(conn, domain, first_name, last_name, dry_run=False):
+    key = f"{domain}:{first_name}:{last_name}"
+    cached = cache_get(conn, "scrape_find", key)
+    if cached:
+        return cached
+    if dry_run:
+        return {"email": None, "confidence": None, "dry_run": True}
+    _throttle("scrape")
+    candidates = _scrape_site_emails(domain)
+    email = _pick_best_email(candidates, domain, first_name, last_name)
+    result = {"email": email, "confidence": "scraped" if email else None}
+    cache_set(conn, "scrape_find", key, result)
     return result
 
 
@@ -433,13 +552,30 @@ def enrich_domain_based(conn, lead: Lead, dry_run):
     if lead.email or not lead.website:
         return lead
     domain = lead.website.replace("https://", "").replace("http://", "").split("/")[0]
-    guess = hunter_find_email(conn, domain, lead.first_name or "info", lead.last_name or "", dry_run)
-    if guess.get("email"):
-        verify = hunter_verify_email(conn, guess["email"], dry_run)
-        if dry_run or verify.get("status") in ("valid", "accept_all"):
+
+    if dry_run or os.environ.get("HUNTER_API_KEY"):
+        guess = hunter_find_email(conn, domain, lead.first_name or "info", lead.last_name or "", dry_run)
+        if guess.get("email"):
+            verify = hunter_verify_email(conn, guess["email"], dry_run)
+            if dry_run or verify.get("status") in ("valid", "accept_all"):
+                lead.email = guess["email"]
+            else:
+                lead._enrichment_notes.append(f"email found but failed verification: {guess['email']} ({verify.get('status')})")
+    else:
+        # No HUNTER_API_KEY set — free fallback: scrape the LEAD'S OWN site instead
+        # of calling Hunter. Lower confidence: no pattern-matching, MX-checked only
+        # (not a real mailbox verification), so every hit here is flagged in
+        # _enrichment_notes rather than trusted the same as a Hunter result.
+        guess = scrape_find_email(conn, domain, lead.first_name, lead.last_name, dry_run)
+        if guess.get("email"):
             lead.email = guess["email"]
-        else:
-            lead._enrichment_notes.append(f"email found but failed verification: {guess['email']} ({verify.get('status')})")
+            mx_ok = _domain_has_mx(guess["email"].split("@", 1)[1])
+            note = "email found via free site scrape, not Hunter-verified"
+            if mx_ok is False:
+                note += " — domain has no MX record, likely undeliverable"
+            elif mx_ok is None:
+                note += " — MX check unavailable (dnspython not installed)"
+            lead._enrichment_notes.append(note)
     return lead
 
 

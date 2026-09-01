@@ -4,3 +4,4 @@ enrich_cache.db
 __pycache__/
 *.pyc
 data/
+.venv/
