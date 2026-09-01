@@ -1,0 +1,6 @@
+.env
+enrich_cache.db
+*.csv
+__pycache__/
+*.pyc
+data/
