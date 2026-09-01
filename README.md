@@ -1,81 +1,106 @@
 # Tactik Lead Enrichment Pipeline
 
-One-shot job, not a server. Hermes runs it via `docker run`, it enriches a source,
-writes a CSV, optionally pushes to Airtable, then exits. No UI — Airtable is the
-visualization layer once rows land there.
+One-shot job, not a server. Hermes runs it via `docker compose run`, it enriches
+a source, writes a CSV, optionally pushes to Airtable, then exits. No UI —
+Airtable is the visualization layer once rows land there.
 
-Field mappings in `pipeline/enrich_pipeline.py` are verified against the real
-uploaded files (not guessed), and each source's real header row is documented
-in its loader's docstring.
+Field mappings in `enrich_pipeline.py` are verified against the real uploaded
+files (not guessed), and each source's real header row is documented in its
+loader's docstring.
 
-## 1. Local test (do this before Docker, before real API keys)
+## 0. Setup
+
+```bash
+git clone <this-repo-url>
+cd tactik-enrich_pipeline
+cp .env.example .env
+```
+
+Fill in `.env` with real values — `HUNTER_API_KEY`, `APOLLO_API_KEY`,
+`PDL_API_KEY`, and (only if you'll use `--airtable-push`) `AIRTABLE_API_KEY` /
+`AIRTABLE_BASE_ID`. Never commit `.env` — it's already in `.gitignore`.
+
+## 1. Local test, no Docker (do this first, before real API keys)
 
 ```bash
 pip install -r requirements.txt --break-system-packages
 
 # Dry run — no API calls, just proves the file parses and the CSV comes out clean
-python pipeline/enrich_pipeline.py \
+python enrich_pipeline.py \
   --source vsbn --input /path/to/vsbn_final.xlsx --output vsbn_test.csv \
   --dry-run --limit 20
 ```
 
 Valid `--source` values: `fresh`, `mazenod`, `transcend`, `vsbn`, `bali`.
 
-Once real keys are set (see `.env.example`), drop `--dry-run` and run the same
-`--limit 20` command to validate real enrichment on a small sample before a
-full run — same "test on ~20 before Hermes runs it at volume" rule you already
-use for everything else.
+Once real keys are set in `.env` (see step 0), drop `--dry-run` and run the
+same `--limit 20` command to validate real enrichment on a small sample
+before a full run — same "test on ~20 before Hermes runs it at volume" rule
+you already use for everything else.
 
-## 2. Build the container
+## 2. Run it locally with Docker Compose
 
-```bash
-docker build -t tactik-lead-enrichment .
-```
-
-## 3. Run it locally against real data (still no Hermes yet)
+Docker Compose is used here purely as a repeatable build/run config — this
+job still exits when it's done, there's nothing to `up`.
 
 ```bash
 mkdir -p data
 cp vsbn_final.xlsx data/
 
-docker run --rm \
-  --env-file .env \
-  -v "$(pwd)/data:/data" \
-  tactik-lead-enrichment \
+docker compose build
+
+docker compose run --rm enrich \
   --source vsbn --input /data/vsbn_final.xlsx --output /data/vsbn_enriched.csv --limit 20
 ```
 
-Check `data/vsbn_enriched.csv` and `data/enrich_cache.db` landed correctly, then
+`docker compose run` reads `.env` automatically (see `docker-compose.yml`)
+and mounts `./data` into the container at `/data`. Check
+`data/vsbn_enriched.csv` and `data/enrich_cache.db` landed correctly, then
 scale `--limit` up and drop it entirely once you trust the output.
 
-## 4. Push the image to the hub server (192.168.0.4)
+## 3. Deploy to production (Docker Compose)
+
+Compose makes production the same shape as local — no `docker save`/`docker
+load` image shuffling, just a git checkout and a build on the server.
 
 ```bash
-docker save tactik-lead-enrichment | ssh udara@192.168.0.4 docker load
-# or, if this repo is on GitHub and the hub server has SSH access to it:
-# git pull && docker build -t tactik-lead-enrichment .
+# on the hub server (192.168.0.4)
+git clone <this-repo-url>
+cd tactik-enrich_pipeline
+cp .env.example .env   # fill in the real production keys, then: chmod 600 .env
+docker compose build
 ```
 
-Put the real `.env` on the hub server directly (never in git) — e.g.
-`~/.hermes/secrets/lead-enrichment.env`.
-
-## 5. Give Hermes the invocation
-
-Hermes already has terminal access — no API server needed. Either as a one-off
-chat command or a skill/cron entry, the exact command it runs is:
+If secrets already live elsewhere on that host by convention (e.g.
+`~/.hermes/secrets/lead-enrichment.env`), symlink instead of duplicating them:
 
 ```bash
-docker run --rm \
-  --env-file ~/.hermes/secrets/lead-enrichment.env \
-  -v /path/to/leads:/data \
-  tactik-lead-enrichment \
+ln -s ~/.hermes/secrets/lead-enrichment.env .env
+```
+
+Either way, `.env` must never be committed — it's already gitignored.
+
+To ship a code change later, no rebuild-and-copy dance is needed:
+
+```bash
+git pull && docker compose build
+```
+
+## 4. Give Hermes the invocation
+
+Hermes already has terminal access — no API server needed. Either as a
+one-off chat command or a skill/cron entry, the exact command it runs from
+the deployed repo directory is:
+
+```bash
+docker compose run --rm enrich \
   --source <source> --input /data/<file> --output /data/<source>_enriched.csv \
   --airtable-push --airtable-table "Leads - <Source Name>"
 ```
 
-Document this exact command in the Obsidian vault (per the "architecture before
-deployment" rule) alongside whichever Hermes skill/cron entry calls it, so it's
-not just known to you.
+Document this exact command in the Obsidian vault (per the "architecture
+before deployment" rule) alongside whichever Hermes skill/cron entry calls
+it, so it's not just known to you.
 
 ## Notes
 

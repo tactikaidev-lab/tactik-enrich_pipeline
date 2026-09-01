@@ -9,11 +9,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY pipeline/ ./pipeline/
+COPY enrich_pipeline.py .
 
 # /data is where Hermes mounts the raw input files and where the CSV output
 # and the sqlite cache land, so both persist across container runs.
 VOLUME ["/data"]
 WORKDIR /data
 
-ENTRYPOINT ["python", "/app/pipeline/enrich_pipeline.py"]
+ENTRYPOINT ["python", "/app/enrich_pipeline.py"]

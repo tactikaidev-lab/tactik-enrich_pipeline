@@ -1,0 +1,16 @@
+# This is a one-shot job, not a long-running server — there's nothing to
+# `docker compose up`. Compose here just gives you a repeatable build + run
+# config instead of retyping `docker build` / `docker run` flags by hand.
+#
+# Build:  docker compose build
+# Run:    docker compose run --rm enrich --source vsbn --input /data/vsbn_final.xlsx --output /data/vsbn_enriched.csv --limit 20
+#
+# Same config on the production host — see README.md for the full deploy flow.
+
+services:
+  enrich:
+    build: .
+    image: tactik-lead-enrichment
+    env_file: .env
+    volumes:
+      - ./data:/data
