@@ -673,12 +673,127 @@ def load_bali_group(path):
     return leads
 
 
+def _normalize_header(h):
+    return re.sub(r"[^a-z0-9]+", " ", str(h or "").strip().lower()).strip()
+
+
+# Common column-name variants for a well-formed but previously-unseen list —
+# every header is compared against these after normalizing (lowercased,
+# punctuation collapsed to spaces), so "E-Mail", "Email Address", and
+# "emails" all match the same field.
+_GENERIC_FIELD_SYNONYMS = {
+    "first_name": ("first name", "firstname", "first"),
+    "last_name": ("last name", "lastname", "last", "surname"),
+    "business_name": ("business name", "company", "company name", "organization", "organisation", "business"),
+    "phone": ("phone", "phone number", "mobile", "contact number", "tel", "telephone"),
+    "email": ("email", "e mail", "email address", "emails"),
+    "linkedin": ("linkedin", "linkedin url", "linkedin profile"),
+    "website": ("website", "site", "url", "web", "web site"),
+    "address": ("address", "location"),
+    "categories": ("categories", "category", "tags", "industry", "business type", "business types"),
+    "description": ("description", "bio", "about", "notes"),
+    "rating": ("rating",),
+    "review_count": ("review count", "reviews", "number of reviews"),
+    "social_links": ("facebook", "social", "social links", "social media"),
+    "website_score": ("website score",),
+}
+_GENERIC_NAME_HEADERS = ("name", "full name", "contact name")
+
+
+def load_generic(path):
+    """Fallback loader for --source auto: any well-formed .xlsx/.xls/.csv
+    that ISN'T one of the 5 sources above. Auto-maps common column-name
+    variants onto the same Lead schema everything else uses (see
+    _GENERIC_FIELD_SYNONYMS), splits a single "Name" column into first/last
+    if there's no separate first-name column, and — critically — never
+    silently drops a column it doesn't recognize: unmapped values get folded
+    into `description` as "Header: value" pairs, and the unmapped headers are
+    printed once up front so that's visible before enrichment runs, not
+    discovered after. This is what makes the pipeline usable on a new list
+    without writing a new loader first; a source with genuinely unusual
+    structure (like bali's nested JSON) still needs one."""
+    ext = Path(path).suffix.lower()
+    if ext in (".xlsx", ".xls"):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True)
+        ws = wb.active
+        raw_headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        rows_iter = ws.iter_rows(min_row=2, values_only=True)
+    elif ext == ".csv":
+        f = open(path, newline="", encoding="utf-8-sig")
+        reader = csv.reader(f)
+        raw_headers = next(reader)
+        rows_iter = reader
+    else:
+        raise ValueError(f"load_generic only supports .xlsx/.xls/.csv — got {ext or '(no extension)'}")
+
+    norm_headers = [_normalize_header(h) for h in raw_headers]
+    col_for_field = {}
+    used_cols = set()
+    for field, synonyms in _GENERIC_FIELD_SYNONYMS.items():
+        for i, nh in enumerate(norm_headers):
+            if nh in synonyms and i not in used_cols:
+                col_for_field[field] = i
+                used_cols.add(i)
+                break
+
+    name_col = None
+    if "first_name" not in col_for_field:
+        for i, nh in enumerate(norm_headers):
+            if nh in _GENERIC_NAME_HEADERS and i not in used_cols:
+                name_col = i
+                used_cols.add(i)
+                break
+
+    unmapped = [raw_headers[i] for i in range(len(raw_headers)) if i not in used_cols and raw_headers[i]]
+    if unmapped:
+        print(f"load_generic: {len(unmapped)} column(s) not recognized, folded into description: {unmapped}", file=sys.stderr)
+
+    leads = []
+    for row in rows_iter:
+        row = list(row)
+        kwargs = {field: (_clean(row[i]) if i < len(row) else "") for field, i in col_for_field.items()}
+        if name_col is not None and name_col < len(row):
+            full = _clean(row[name_col])
+            if full:
+                parts = full.split(" ", 1)
+                kwargs.setdefault("first_name", parts[0])
+                kwargs.setdefault("last_name", parts[1] if len(parts) > 1 else "")
+        extra_bits = [
+            f"{raw_headers[i]}: {_clean(row[i])}"
+            for i in range(len(raw_headers))
+            if i not in used_cols and i < len(row) and row[i] not in (None, "")
+        ]
+        if extra_bits:
+            existing = kwargs.get("description", "")
+            kwargs["description"] = (existing + " | " if existing else "") + "; ".join(extra_bits)
+        kwargs["source"] = "auto"
+        leads.append(Lead(**kwargs))
+    return leads
+
+
+def enrich_auto(conn, lead: Lead, dry_run, smtp_verify=False):
+    """Strategy for --source auto: same domain-based lookup as VSBN/Transcend
+    when the row has a website; otherwise there's nothing free to search
+    from (no known domain, no phone-lookup key) so it's left as-is and
+    flagged, same honesty as enrich_mazenod above."""
+    if lead.website:
+        return enrich_domain_based(conn, lead, dry_run, smtp_verify=smtp_verify)
+    if not lead.email:
+        lead._enrichment_notes.append(
+            "auto-loaded row with no website — nothing free to enrich from; needs a paid "
+            "lookup (phone/name-based) or manual research"
+        )
+    return lead
+
+
 SOURCE_LOADERS = {
     "fresh": load_fresh_networking,
     "mazenod": load_mazenod,
     "transcend": load_transcend,
     "vsbn": load_vsbn,
     "bali": load_bali_group,
+    "auto": load_generic,
 }
 
 
@@ -772,7 +887,13 @@ ENRICH_STRATEGIES = {
     "vsbn": enrich_domain_based,
     "transcend": enrich_domain_based,
     "bali": enrich_bali,
+    "auto": enrich_auto,
 }
+
+# Strategies that accept smtp_verify — main()/run_pipeline() binds it via
+# functools.partial for exactly these, so every other strategy keeps its
+# plain (conn, lead, dry_run) signature unchanged.
+_SMTP_VERIFY_AWARE_STRATEGIES = (enrich_domain_based, enrich_auto)
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +967,129 @@ def _field_fill_counts(leads):
     return counts
 
 
+def run_pipeline(
+    source, input_path, output_path, *,
+    limit=None, dry_run=False, smtp_verify=False,
+    airtable_push_flag=False, airtable_table=None,
+    print_progress=True,
+):
+    """The pipeline's actual core — load, enrich (with per-row error
+    isolation), write CSV + summary.json, optionally push to Airtable.
+    Returns the same summary dict that gets written to <output>.summary.json.
+
+    This is what both entry points call: the CLI's main() (thin arg-parsing
+    wrapper around this) and the MCP server (imports and calls this
+    directly — see mcp_server/app.py). Keeping one real implementation means
+    a fix or a new source loader is instantly available from both, instead
+    of needing to be duplicated and kept in sync.
+
+    Raises ValueError for caller mistakes (bad source, missing input file,
+    --airtable-table missing when airtable_push_flag is set) rather than
+    calling sys.exit — this runs inside a long-lived MCP server process as
+    often as it runs as a one-shot CLI, and sys.exit there would take the
+    whole server down over one bad call."""
+    if source not in SOURCE_LOADERS:
+        raise ValueError(f"unknown source '{source}' — must be one of: {', '.join(SOURCE_LOADERS)}")
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    if not input_path.exists():
+        raise ValueError(f"input file not found: {input_path}")
+    if airtable_push_flag and not airtable_table:
+        raise ValueError("airtable_table is required when airtable_push_flag is set")
+
+    started_at = datetime.now(timezone.utc)
+    conn = init_cache()
+    leads = SOURCE_LOADERS[source](input_path)
+    if limit:
+        leads = leads[:limit]
+
+    field_fill_before = _field_fill_counts(leads)
+
+    # Per-row try/except so one bad API response, timeout, or malformed row
+    # can't take down an entire batch — earlier versions let a raised
+    # exception from e.g. hunter_find_email kill the whole run mid-way,
+    # discarding hours of already-completed (but not-yet-written) enrichment.
+    # The CSV is now also written incrementally (flushed every row), so a
+    # hard kill (OOM, container restart) leaves a usable partial file instead
+    # of nothing — re-running picks up instantly for already-cached lookups.
+    strategy = ENRICH_STRATEGIES[source]
+    if strategy in _SMTP_VERIFY_AWARE_STRATEGIES:
+        strategy = functools.partial(strategy, smtp_verify=smtp_verify)
+    enriched, notes, errored = 0, 0, 0
+    errors = []
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TARGET_FIELDS)
+        writer.writeheader()
+        for i, lead in enumerate(leads):
+            before = _target_snapshot(lead)
+            try:
+                strategy(conn, lead, dry_run)
+            except Exception as exc:
+                errored += 1
+                identifier = (
+                    lead.email or lead.business_name or lead.phone
+                    or f"{lead.first_name} {lead.last_name}".strip() or f"row {i}"
+                )
+                errors.append({"row_index": i, "identifier": identifier, "error": f"{type(exc).__name__}: {exc}"})
+                lead._enrichment_notes.append(f"enrichment error, row left as-is: {type(exc).__name__}: {exc}")
+                if print_progress:
+                    print(f"  [{i}] enrichment error, continuing: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if _target_snapshot(lead) != before:
+                enriched += 1
+            if lead._enrichment_notes:
+                notes += 1
+            writer.writerow(_output_row(lead))
+            f.flush()
+
+    field_fill_after = _field_fill_counts(leads)
+    rows_for_output = [_output_row(lead) for lead in leads]
+
+    if print_progress:
+        print(
+            f"{source}: {len(leads)} rows processed, {enriched} enriched, "
+            f"{notes} flagged for manual review" + (f", {errored} errored" if errored else "")
+        )
+        print(f"-> {output_path}")
+        if dry_run:
+            print("(dry run — no paid API calls were made)")
+
+    airtable_result = None
+    if airtable_push_flag:
+        pushed, failed = airtable_push(rows_for_output, airtable_table, dry_run)
+        airtable_result = {"attempted": True, "pushed": pushed, "failed": failed}
+        if print_progress:
+            print(f"Airtable push: {pushed} pushed, {failed} failed" + (" (dry run)" if dry_run else ""))
+
+    # Machine-readable run summary — this is what Hermes (via bin/enrich) or
+    # the MCP server should read to decide what happened, rather than
+    # parsing stdout. Sits next to the CSV as <output>.summary.json.
+    summary = {
+        "source": source,
+        "input": str(input_path),
+        "output": str(output_path),
+        "started_at": started_at.isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "dry_run": dry_run,
+        "rows_total": len(leads),
+        "rows_enriched": enriched,
+        "rows_flagged_for_review": notes,
+        "rows_errored": errored,
+        "field_fill_before": field_fill_before,
+        "field_fill_after": field_fill_after,
+        "errors": errors,
+        "airtable": airtable_result,
+    }
+    summary_path = output_path.with_suffix(".summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    if print_progress:
+        print(f"-> {summary_path} (machine-readable run summary)")
+
+    return summary
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", required=True, choices=list(SOURCE_LOADERS.keys()))
@@ -857,109 +1101,27 @@ def main():
     ap.add_argument("--airtable-table", type=str, default=None)
     ap.add_argument(
         "--smtp-verify", action="store_true",
-        help="OPT-IN, vsbn/transcend only, no-op unless HUNTER_API_KEY is unset. When the free "
-             "site-scrape fallback finds nothing, also try pattern-guessed addresses "
+        help="OPT-IN, vsbn/transcend/auto only, no-op unless HUNTER_API_KEY is unset. When the "
+             "free site-scrape fallback finds nothing, also try pattern-guessed addresses "
              "(first.last@domain, info@domain, etc.) confirmed via a real (no-send) SMTP "
              "RCPT TO against the lead's own mail server. Off by default: this opens outbound "
              "SMTP connections to third-party servers, which some networks treat as probing/abuse.",
     )
     args = ap.parse_args()
 
-    if not args.input.exists():
-        sys.exit(f"Input file not found: {args.input}")
-    if args.airtable_push and not args.airtable_table:
-        sys.exit("--airtable-table is required when using --airtable-push")
-
-    started_at = datetime.now(timezone.utc)
-    conn = init_cache()
-    leads = SOURCE_LOADERS[args.source](args.input)
-    if args.limit:
-        leads = leads[: args.limit]
-
-    field_fill_before = _field_fill_counts(leads)
-
-    # Per-row try/except so one bad API response, timeout, or malformed row
-    # can't take down an entire batch — earlier versions let a raised
-    # exception from e.g. hunter_find_email kill the whole run mid-way,
-    # discarding hours of already-completed (but not-yet-written) enrichment.
-    # The CSV is now also written incrementally (flushed every row), so a
-    # hard kill (OOM, container restart) leaves a usable partial file instead
-    # of nothing — re-running picks up instantly for already-cached lookups.
-    strategy = ENRICH_STRATEGIES[args.source]
-    if strategy is enrich_domain_based:
-        strategy = functools.partial(strategy, smtp_verify=args.smtp_verify)
-    enriched, notes, errored = 0, 0, 0
-    errors = []
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=TARGET_FIELDS)
-        writer.writeheader()
-        for i, lead in enumerate(leads):
-            before = _target_snapshot(lead)
-            try:
-                strategy(conn, lead, args.dry_run)
-            except Exception as exc:
-                errored += 1
-                identifier = (
-                    lead.email or lead.business_name or lead.phone
-                    or f"{lead.first_name} {lead.last_name}".strip() or f"row {i}"
-                )
-                errors.append({"row_index": i, "identifier": identifier, "error": f"{type(exc).__name__}: {exc}"})
-                lead._enrichment_notes.append(f"enrichment error, row left as-is: {type(exc).__name__}: {exc}")
-                print(f"  [{i}] enrichment error, continuing: {type(exc).__name__}: {exc}", file=sys.stderr)
-            if _target_snapshot(lead) != before:
-                enriched += 1
-            if lead._enrichment_notes:
-                notes += 1
-            writer.writerow(_output_row(lead))
-            f.flush()
-
-    field_fill_after = _field_fill_counts(leads)
-    rows_for_output = [_output_row(lead) for lead in leads]
-
-    print(
-        f"{args.source}: {len(leads)} rows processed, {enriched} enriched, "
-        f"{notes} flagged for manual review" + (f", {errored} errored" if errored else "")
-    )
-    print(f"-> {args.output}")
-    if args.dry_run:
-        print("(dry run — no paid API calls were made)")
-
-    airtable_result = None
-    if args.airtable_push:
-        pushed, failed = airtable_push(rows_for_output, args.airtable_table, args.dry_run)
-        airtable_result = {"attempted": True, "pushed": pushed, "failed": failed}
-        print(f"Airtable push: {pushed} pushed, {failed} failed" + (" (dry run)" if args.dry_run else ""))
-
-    # Machine-readable run summary — this is what Hermes should parse to decide
-    # whether/what to fix, rather than scraping stdout. Sits next to the CSV as
-    # <output>.summary.json (e.g. vsbn_enriched.csv -> vsbn_enriched.summary.json).
-    summary = {
-        "source": args.source,
-        "input": str(args.input),
-        "output": str(args.output),
-        "started_at": started_at.isoformat(),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-        "dry_run": args.dry_run,
-        "rows_total": len(leads),
-        "rows_enriched": enriched,
-        "rows_flagged_for_review": notes,
-        "rows_errored": errored,
-        "field_fill_before": field_fill_before,
-        "field_fill_after": field_fill_after,
-        "errors": errors,
-        "airtable": airtable_result,
-    }
-    summary_path = args.output.with_suffix(".summary.json")
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"-> {summary_path} (machine-readable run summary for Hermes)")
+    try:
+        summary = run_pipeline(
+            args.source, args.input, args.output,
+            limit=args.limit, dry_run=args.dry_run, smtp_verify=args.smtp_verify,
+            airtable_push_flag=args.airtable_push, airtable_table=args.airtable_table,
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     # Non-zero exit on partial failure — the CSV/Airtable push still completed
     # for every other row, but an orchestrator (Hermes) should know something
     # needs attention rather than silently treating this as a clean run.
-    if errored:
+    if summary["rows_errored"]:
         sys.exit(1)
 
 

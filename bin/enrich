@@ -13,7 +13,11 @@ usage() {
   cat <<'EOF'
 Usage: bin/enrich <source> <input-file> [options]
 
-  <source>       fresh | mazenod | transcend | vsbn | bali
+  <source>       fresh | mazenod | transcend | vsbn | bali | auto
+                 "auto" handles any well-formed .xlsx/.xls/.csv that ISN'T
+                 one of the 5 known lists — it auto-maps common column
+                 names (Email, Company, Website, Phone, ...) instead of
+                 needing a purpose-built loader. Use it for a new list.
   <input-file>   a filename already in ./data, or any path on this host —
                  if it isn't in ./data yet, it's copied in automatically
 
@@ -22,16 +26,21 @@ Options:
   --limit N        process only the first N rows (use this before a full run)
   --push           push the enriched rows into Airtable when done (table
                     name is picked automatically from <source> — see below,
-                    or override with --table)
+                    or override with --table; REQUIRED with --push when
+                    <source> is auto, since there's no one natural table
+                    for an arbitrary list)
   --table NAME     Airtable table name to use with --push, instead of the
                     automatic one
-  --smtp-verify    opt-in free-tier coverage boost, vsbn/transcend only —
-                    read enrich_pipeline.py's module docstring before using
+  --smtp-verify    opt-in free-tier coverage boost, vsbn/transcend/auto
+                    only — read enrich_pipeline.py's module docstring
+                    before using
   -h, --help       show this help
 
 Examples:
   bin/enrich vsbn vsbn_final.xlsx --dry-run --limit 20
   bin/enrich vsbn vsbn_final.xlsx --push
+  bin/enrich auto new_list_someone_sent_us.xlsx --dry-run --limit 20
+  bin/enrich auto new_list_someone_sent_us.xlsx --push --table "Leads - New List"
 
 Output:
   ./data/<source>_enriched.csv
@@ -42,13 +51,14 @@ enrich_pipeline.py already gives — this script just passes it through).
 EOF
 }
 
-VALID_SOURCES="fresh mazenod transcend vsbn bali"
+VALID_SOURCES="fresh mazenod transcend vsbn bali auto"
 
 # Default Airtable table per source — override per-run with --table if a
-# different name is ever needed. A case statement rather than an associative
-# array on purpose: associative arrays need bash 4+, and macOS still ships
-# bash 3.2 by default, so this stays portable to whatever's actually running
-# this script.
+# different name is ever needed. "auto" deliberately has no default: an
+# arbitrary list needs a human to say where it goes. A case statement
+# rather than an associative array on purpose: associative arrays need
+# bash 4+, and macOS still ships bash 3.2 by default, so this stays portable
+# to whatever's actually running this script.
 airtable_table_for() {
   case "$1" in
     fresh)     echo "Leads - Fresh Networking" ;;
@@ -56,6 +66,7 @@ airtable_table_for() {
     transcend) echo "Leads - Transcend" ;;
     vsbn)      echo "Leads - VSBN" ;;
     bali)      echo "Leads - Bali WhatsApp" ;;
+    auto)      echo "" ;;
   esac
 }
 
@@ -110,7 +121,17 @@ else
   exit 1
 fi
 
-OUT_CSV="${SOURCE}_enriched.csv"
+# For the 5 known sources, one canonical input -> one canonical output name.
+# For "auto", many different arbitrary lists can flow through the same
+# source name, so the output is named after the input file instead —
+# otherwise a second auto run would silently overwrite the first's CSV.
+if [[ "$SOURCE" == "auto" ]]; then
+  STEM="$(basename "$IN_FILE")"
+  STEM="${STEM%.*}"
+  OUT_CSV="auto_${STEM}_enriched.csv"
+else
+  OUT_CSV="${SOURCE}_enriched.csv"
+fi
 
 ARGS=(--source "$SOURCE" --input "/data/$IN_FILE" --output "/data/$OUT_CSV")
 [[ $DRY_RUN -eq 1 ]] && ARGS+=(--dry-run)
@@ -118,6 +139,10 @@ ARGS=(--source "$SOURCE" --input "/data/$IN_FILE" --output "/data/$OUT_CSV")
 [[ $SMTP_VERIFY -eq 1 ]] && ARGS+=(--smtp-verify)
 if [[ $PUSH -eq 1 ]]; then
   TABLE="${TABLE_OVERRIDE:-$(airtable_table_for "$SOURCE")}"
+  if [[ -z "$TABLE" ]]; then
+    echo "error: --push with source 'auto' needs an explicit --table \"Name\" — there's no automatic table for an arbitrary list" >&2
+    exit 1
+  fi
   ARGS+=(--airtable-push --airtable-table "$TABLE")
 fi
 
@@ -129,5 +154,5 @@ EXIT_CODE=$?
 set -e
 
 echo
-echo "Full machine-readable result: data/${SOURCE}_enriched.summary.json"
+echo "Full machine-readable result: data/${OUT_CSV%.csv}.summary.json"
 exit "$EXIT_CODE"
