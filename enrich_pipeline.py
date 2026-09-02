@@ -42,10 +42,14 @@ USAGE
   --dry-run                 no paid API calls, just report what would happen
   --airtable-push           after writing the CSV, push rows into Airtable
   --airtable-table NAME     Airtable table name (required if --airtable-push)
+  --smtp-verify             OPT-IN, vsbn/transcend only: when HUNTER_API_KEY is unset and the
+                            free site-scrape finds nothing, also try pattern-guessed addresses
+                            confirmed via real (no-send) SMTP RCPT TO. Off by default — see
+                            DESIGN NOTES below for why.
 
 DESIGN NOTES
   - Every API call is cached to a local sqlite db (enrich_cache.db), keyed by lookup
-    key, so re-runs never pay twice for the same lookup.
+    key, so re-runs never pay twice for the same lookup. MX checks are cached too.
   - Hunter's email VERIFIER always runs on any Hunter-found email before it's accepted.
   - Known-blocked approaches (LinkedIn scraping, search-engine scraping, free
     reverse-phone lookup) are deliberately NOT implemented — already tried and
@@ -59,10 +63,45 @@ DESIGN NOTES
     row enriched this way gets a note in `_enrichment_notes` saying so, so it's
     flagged for review rather than silently trusted the same as a Hunter result.
     Once HUNTER_API_KEY is set, this fallback stops being used automatically.
+    MEASURED: on a real 56-domain sample of VSBN leads (2026-09), this found 0
+    emails — most modern small-business sites don't expose one in raw HTML
+    anymore (contact forms / JS obfuscation instead). Treat it as a compliance
+    fallback that costs nothing to leave on, not a real coverage strategy — a
+    free Hunter.io key (25 finds + 50 verifications/month, no card) will
+    outperform it because Hunter pattern-guesses candidates rather than only
+    reading what's already published.
+  - --smtp-verify (opt-in, off by default): the free equivalent of Hunter's
+    pattern-guess-then-verify, when nothing's already published on the site.
+    Generates likely addresses (first.last@domain, info@domain, etc.) and
+    confirms each via a real RCPT TO against the lead's own mail server
+    (never a third party), no message ever sent. Left off by default because
+    it's a materially different footprint than the rest of this pipeline —
+    an active connection to someone else's mail server, which some networks
+    flag as probing, versus passive HTTP/DNS elsewhere. Also worth knowing:
+    catch-all domains accept RCPT TO for anything, which shows up as a false
+    "accepted" here — flagged in the note on every hit from this path.
+  - Provider HTTP calls (Hunter/Apollo/PDL/Airtable) retry transient failures
+    (timeouts, connection errors, 5xx) with exponential backoff via
+    _request_with_retry before giving up — a single flaky response no longer
+    needs a full re-run.
+  - Per-row error isolation: if a row's enrichment call raises (bad data, an
+    exhausted quota, a provider outage), that row is logged, flagged in
+    `_enrichment_notes`, counted in the run summary, and the batch continues —
+    it does not abort the rest of the rows. The CSV is written incrementally
+    (flushed row-by-row) for the same reason: a hard kill leaves a usable
+    partial file, not nothing.
+  - Every run writes `<output>.summary.json` alongside the CSV — rows
+    processed/enriched/flagged/errored, per-field fill counts before and
+    after, and the specific errors (row + identifier + exception). This is
+    the machine-readable surface Hermes should read to decide what (if
+    anything) needs fixing, rather than parsing stdout. The process also
+    exits non-zero if any row errored, even though the CSV/Airtable push
+    still completed for every other row.
 """
 
 import argparse
 import csv
+import functools
 import json
 import os
 import re
@@ -70,6 +109,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -84,7 +124,7 @@ except ImportError:
     _dns_resolver = None
 
 CACHE_DB = "enrich_cache.db"
-RATE_LIMIT_SECONDS = {"hunter": 1.0, "apollo": 1.0, "pdl": 1.0, "airtable": 0.25, "scrape": 1.5}
+RATE_LIMIT_SECONDS = {"hunter": 1.0, "apollo": 1.0, "pdl": 1.0, "airtable": 0.25, "scrape": 1.5, "smtp": 2.0}
 
 TARGET_FIELDS = [
     "first_name", "last_name", "business_name", "phone", "email",
@@ -159,8 +199,29 @@ def _throttle(provider):
 
 # ---------------------------------------------------------------------------
 # Provider calls — cache-aware, rate-limited, safe to call with --dry-run and
-# zero keys set.
+# zero keys set. All go through _request_with_retry so a single flaky response
+# from one provider can't take down the whole batch (see main()'s per-row
+# try/except for the second half of that guarantee).
 # ---------------------------------------------------------------------------
+
+def _request_with_retry(method, url, max_retries=2, backoff=1.0, **kwargs):
+    """requests.request wrapper that retries transient failures (timeouts,
+    connection errors, 5xx) with exponential backoff. 4xx responses are
+    returned as-is, not retried — those are real answers (bad request, not
+    found, bad auth), and retrying them just burns quota for the same result."""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.RequestException:
+            if attempt < max_retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise
+        if resp.status_code >= 500 and attempt < max_retries:
+            time.sleep(backoff * (2 ** attempt))
+            continue
+        return resp
+
 
 def hunter_find_email(conn, domain, first_name, last_name, dry_run=False):
     key = f"{domain}:{first_name}:{last_name}"
@@ -173,8 +234,8 @@ def hunter_find_email(conn, domain, first_name, last_name, dry_run=False):
     if not api_key:
         raise RuntimeError("HUNTER_API_KEY not set")
     _throttle("hunter")
-    resp = requests.get(
-        "https://api.hunter.io/v2/email-finder",
+    resp = _request_with_retry(
+        "GET", "https://api.hunter.io/v2/email-finder",
         params={"domain": domain, "first_name": first_name, "last_name": last_name, "api_key": api_key},
         timeout=15,
     )
@@ -195,8 +256,8 @@ def hunter_verify_email(conn, email, dry_run=False):
     if not api_key:
         raise RuntimeError("HUNTER_API_KEY not set")
     _throttle("hunter")
-    resp = requests.get(
-        "https://api.hunter.io/v2/email-verifier",
+    resp = _request_with_retry(
+        "GET", "https://api.hunter.io/v2/email-verifier",
         params={"email": email, "api_key": api_key},
         timeout=15,
     )
@@ -218,8 +279,8 @@ def apollo_enrich_person(conn, first_name, last_name, company, dry_run=False):
     if not api_key:
         raise RuntimeError("APOLLO_API_KEY not set")
     _throttle("apollo")
-    resp = requests.post(
-        "https://api.apollo.io/v1/people/match",
+    resp = _request_with_retry(
+        "POST", "https://api.apollo.io/v1/people/match",
         headers={"Cache-Control": "no-cache", "Content-Type": "application/json"},
         json={"api_key": api_key, "first_name": first_name, "last_name": last_name, "organization_name": company},
         timeout=15,
@@ -245,8 +306,8 @@ def pdl_enrich_phone(conn, phone, dry_run=False):
     if not api_key:
         raise RuntimeError("PDL_API_KEY not set")
     _throttle("pdl")
-    resp = requests.get(
-        "https://api.peopledatalabs.com/v5/person/enrich",
+    resp = _request_with_retry(
+        "GET", "https://api.peopledatalabs.com/v5/person/enrich",
         headers={"X-Api-Key": api_key},
         params={"phone": phone},
         timeout=15,
@@ -336,17 +397,24 @@ def _pick_best_email(candidates, domain, first_name, last_name):
     return sorted(on_domain)[0]
 
 
-def _domain_has_mx(domain):
+def _domain_has_mx(conn, domain):
     """Best-effort MX check — confirms the domain CAN receive mail. This is not a
     mailbox verification like Hunter's verifier, just a sanity check for the free
     fallback. Returns None (not False) if dnspython isn't installed, so callers can
-    tell 'checked and failed' apart from 'couldn't check'."""
+    tell 'checked and failed' apart from 'couldn't check'. Cached like every other
+    lookup here — a domain's MX record doesn't change often enough to justify
+    re-querying DNS on every re-run."""
+    cached = cache_get(conn, "mx_check", domain)
+    if cached is not None:
+        return cached["mx_ok"]
     if _dns_resolver is None:
         return None
     try:
-        return len(_dns_resolver.resolve(domain, "MX", lifetime=5)) > 0
+        mx_ok = len(_dns_resolver.resolve(domain, "MX", lifetime=5)) > 0
     except Exception:
-        return False
+        mx_ok = False
+    cache_set(conn, "mx_check", domain, {"mx_ok": mx_ok})
+    return mx_ok
 
 
 def scrape_find_email(conn, domain, first_name, last_name, dry_run=False):
@@ -362,6 +430,91 @@ def scrape_find_email(conn, domain, first_name, last_name, dry_run=False):
     result = {"email": email, "confidence": "scraped" if email else None}
     cache_set(conn, "scrape_find", key, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# OPT-IN free pattern-guess + SMTP verify — only runs when --smtp-verify is
+# passed AND the site scrape above found nothing. This is a materially
+# different footprint from the rest of the pipeline: it opens a real SMTP
+# connection to the LEAD'S OWN mail server (never a third party) and issues a
+# HELO/MAIL FROM/RCPT TO, reading whether the server accepts the address,
+# then quits BEFORE the DATA stage — no message is ever sent. Still, it's an
+# active probe against someone else's infrastructure, which some mail
+# servers/networks treat as abuse, and outbound port 25 is blocked by many
+# cloud providers by default (fails fast/cleanly either way — see except
+# below). That's why this stays off unless explicitly requested.
+# Caveat: a "catch-all" domain (accepts RCPT TO for anything) will make every
+# candidate look "accepted" — this is a real false-positive source, distinct
+# from Hunter's verifier which tracks catch-all status explicitly. Every hit
+# from this path is flagged in _enrichment_notes with that caveat attached.
+# ---------------------------------------------------------------------------
+
+_GENERIC_LOCALPARTS = ("info", "contact", "hello")
+
+
+def _generate_email_candidates(domain, first_name, last_name, limit=6):
+    """Most-likely-first list of candidate addresses: person-based patterns
+    (if we have a name) followed by common generic business inboxes."""
+    bare_domain = domain.split(":")[0].lower()
+    fn = re.sub(r"[^a-z]", "", (first_name or "").lower())
+    ln = re.sub(r"[^a-z]", "", (last_name or "").lower())
+    candidates = []
+    if fn and ln:
+        candidates += [f"{fn}.{ln}@{bare_domain}", f"{fn[0]}{ln}@{bare_domain}", f"{fn}@{bare_domain}"]
+    elif fn:
+        candidates.append(f"{fn}@{bare_domain}")
+    candidates += [f"{role}@{bare_domain}" for role in _GENERIC_LOCALPARTS]
+    seen, out = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:limit]
+
+
+def _smtp_verify_email(conn, email, timeout=8):
+    """Best-effort SMTP-level check via RCPT TO — connects to the domain's MX
+    host and asks whether it would accept mail to this address, without
+    sending anything (QUIT before DATA). Cached like every other lookup here,
+    so a given address is never re-probed across runs. Returns "accepted",
+    "rejected", or "unknown" (couldn't determine: no MX, connection refused/
+    blocked, timeout, greylisted, etc. — deliberately not treated the same as
+    a confirmed rejection)."""
+    cached = cache_get(conn, "smtp_verify", email)
+    if cached is not None:
+        return cached["status"]
+    status = "unknown"
+    if _dns_resolver is not None:
+        domain = email.split("@", 1)[1]
+        try:
+            import smtplib
+            mx_records = sorted(_dns_resolver.resolve(domain, "MX", lifetime=5), key=lambda r: r.preference)
+            mx_host = str(mx_records[0].exchange).rstrip(".")
+            with smtplib.SMTP(mx_host, 25, timeout=timeout) as smtp:
+                smtp.helo("verify.tactik-enrichment.local")
+                smtp.mail("verify@tactik-enrichment.local")
+                code, _ = smtp.rcpt(email)
+                if code == 250:
+                    status = "accepted"
+                elif code in (550, 551, 553):
+                    status = "rejected"
+        except Exception:
+            status = "unknown"  # connection refused/blocked, timeout, DNS failure, etc.
+    cache_set(conn, "smtp_verify", email, {"status": status})
+    return status
+
+
+def pattern_guess_and_verify(conn, domain, first_name, last_name, dry_run=False):
+    """Tries each generated candidate in order, stopping at the first one the
+    mail server accepts. Returns {"email": ...} or None. No-ops entirely
+    under --dry-run or if dnspython isn't installed."""
+    if dry_run or _dns_resolver is None:
+        return None
+    for candidate in _generate_email_candidates(domain, first_name, last_name):
+        _throttle("smtp")
+        if _smtp_verify_email(conn, candidate) == "accepted":
+            return {"email": candidate}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +700,7 @@ def enrich_mazenod(conn, lead: Lead, dry_run):
     return lead
 
 
-def enrich_domain_based(conn, lead: Lead, dry_run):
+def enrich_domain_based(conn, lead: Lead, dry_run, smtp_verify=False):
     """Shared strategy for VSBN / Transcend: has a website, missing email."""
     if lead.email or not lead.website:
         return lead
@@ -569,13 +722,27 @@ def enrich_domain_based(conn, lead: Lead, dry_run):
         guess = scrape_find_email(conn, domain, lead.first_name, lead.last_name, dry_run)
         if guess.get("email"):
             lead.email = guess["email"]
-            mx_ok = _domain_has_mx(guess["email"].split("@", 1)[1])
+            mx_ok = _domain_has_mx(conn, guess["email"].split("@", 1)[1])
             note = "email found via free site scrape, not Hunter-verified"
             if mx_ok is False:
                 note += " — domain has no MX record, likely undeliverable"
             elif mx_ok is None:
                 note += " — MX check unavailable (dnspython not installed)"
+            else:
+                note += " — domain has a valid MX record (mail-capable, not a full mailbox verification)"
             lead._enrichment_notes.append(note)
+        elif smtp_verify and not _is_social_platform(domain):
+            # Opt-in only (--smtp-verify): the scrape found nothing published,
+            # so try pattern-guessed addresses and confirm each via a real
+            # (no-send) SMTP RCPT TO against the lead's own mail server.
+            guess2 = pattern_guess_and_verify(conn, domain, lead.first_name, lead.last_name, dry_run)
+            if guess2 and guess2.get("email"):
+                lead.email = guess2["email"]
+                lead._enrichment_notes.append(
+                    "email found via free pattern-guess + SMTP verification (opt-in --smtp-verify), "
+                    "not Hunter-verified — mail server accepted RCPT TO for this address; "
+                    "catch-all domains can produce false positives here"
+                )
     return lead
 
 
@@ -629,7 +796,12 @@ def airtable_push(rows, table_name, dry_run=False):
             pushed += len(batch)
             continue
         _throttle("airtable")
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        try:
+            resp = _request_with_retry("POST", url, headers=headers, json=payload, timeout=15)
+        except requests.RequestException as exc:
+            failed += len(batch)
+            print(f"  Airtable batch failed (network error, not retried further): {exc}", file=sys.stderr)
+            continue
         if resp.ok:
             pushed += len(batch)
         else:
@@ -642,6 +814,26 @@ def airtable_push(rows, table_name, dry_run=False):
 # Main
 # ---------------------------------------------------------------------------
 
+def _target_snapshot(lead):
+    """Only the fields that actually end up in the CSV/Airtable — used to decide
+    whether a row was really enriched, as opposed to just picking up an
+    _enrichment_notes entry (e.g. mazenod's blanket "not enrichable" note,
+    or an error note), which isn't the same thing."""
+    return {k: v for k, v in asdict(lead).items() if k in TARGET_FIELDS}
+
+
+def _field_fill_counts(leads):
+    """Per-field non-empty counts across a batch — used to report real
+    before/after coverage in the run summary, not just a row-count guess."""
+    counts = {f: 0 for f in TARGET_FIELDS}
+    for lead in leads:
+        snap = _target_snapshot(lead)
+        for f in TARGET_FIELDS:
+            if snap.get(f):
+                counts[f] += 1
+    return counts
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", required=True, choices=list(SOURCE_LOADERS.keys()))
@@ -651,6 +843,14 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--airtable-push", action="store_true")
     ap.add_argument("--airtable-table", type=str, default=None)
+    ap.add_argument(
+        "--smtp-verify", action="store_true",
+        help="OPT-IN, vsbn/transcend only, no-op unless HUNTER_API_KEY is unset. When the free "
+             "site-scrape fallback finds nothing, also try pattern-guessed addresses "
+             "(first.last@domain, info@domain, etc.) confirmed via a real (no-send) SMTP "
+             "RCPT TO against the lead's own mail server. Off by default: this opens outbound "
+             "SMTP connections to third-party servers, which some networks treat as probing/abuse.",
+    )
     args = ap.parse_args()
 
     if not args.input.exists():
@@ -658,36 +858,97 @@ def main():
     if args.airtable_push and not args.airtable_table:
         sys.exit("--airtable-table is required when using --airtable-push")
 
+    started_at = datetime.now(timezone.utc)
     conn = init_cache()
     leads = SOURCE_LOADERS[args.source](args.input)
     if args.limit:
         leads = leads[: args.limit]
 
+    field_fill_before = _field_fill_counts(leads)
+
+    # Per-row try/except so one bad API response, timeout, or malformed row
+    # can't take down an entire batch — earlier versions let a raised
+    # exception from e.g. hunter_find_email kill the whole run mid-way,
+    # discarding hours of already-completed (but not-yet-written) enrichment.
+    # The CSV is now also written incrementally (flushed every row), so a
+    # hard kill (OOM, container restart) leaves a usable partial file instead
+    # of nothing — re-running picks up instantly for already-cached lookups.
     strategy = ENRICH_STRATEGIES[args.source]
-    enriched, notes = 0, 0
-    for lead in leads:
-        before = asdict(lead)
-        strategy(conn, lead, args.dry_run)
-        if asdict(lead) != before:
-            enriched += 1
-        if lead._enrichment_notes:
-            notes += 1
+    if strategy is enrich_domain_based:
+        strategy = functools.partial(strategy, smtp_verify=args.smtp_verify)
+    enriched, notes, errored = 0, 0, 0
+    errors = []
 
-    rows_for_output = [{k: v for k, v in asdict(lead).items() if k in TARGET_FIELDS} for lead in leads]
-
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=TARGET_FIELDS)
         writer.writeheader()
-        writer.writerows(rows_for_output)
+        for i, lead in enumerate(leads):
+            before = _target_snapshot(lead)
+            try:
+                strategy(conn, lead, args.dry_run)
+            except Exception as exc:
+                errored += 1
+                identifier = (
+                    lead.email or lead.business_name or lead.phone
+                    or f"{lead.first_name} {lead.last_name}".strip() or f"row {i}"
+                )
+                errors.append({"row_index": i, "identifier": identifier, "error": f"{type(exc).__name__}: {exc}"})
+                lead._enrichment_notes.append(f"enrichment error, row left as-is: {type(exc).__name__}: {exc}")
+                print(f"  [{i}] enrichment error, continuing: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if _target_snapshot(lead) != before:
+                enriched += 1
+            if lead._enrichment_notes:
+                notes += 1
+            writer.writerow(_target_snapshot(lead))
+            f.flush()
 
-    print(f"{args.source}: {len(leads)} rows processed, {enriched} enriched, {notes} flagged for manual review")
+    field_fill_after = _field_fill_counts(leads)
+    rows_for_output = [_target_snapshot(lead) for lead in leads]
+
+    print(
+        f"{args.source}: {len(leads)} rows processed, {enriched} enriched, "
+        f"{notes} flagged for manual review" + (f", {errored} errored" if errored else "")
+    )
     print(f"-> {args.output}")
     if args.dry_run:
         print("(dry run — no paid API calls were made)")
 
+    airtable_result = None
     if args.airtable_push:
         pushed, failed = airtable_push(rows_for_output, args.airtable_table, args.dry_run)
+        airtable_result = {"attempted": True, "pushed": pushed, "failed": failed}
         print(f"Airtable push: {pushed} pushed, {failed} failed" + (" (dry run)" if args.dry_run else ""))
+
+    # Machine-readable run summary — this is what Hermes should parse to decide
+    # whether/what to fix, rather than scraping stdout. Sits next to the CSV as
+    # <output>.summary.json (e.g. vsbn_enriched.csv -> vsbn_enriched.summary.json).
+    summary = {
+        "source": args.source,
+        "input": str(args.input),
+        "output": str(args.output),
+        "started_at": started_at.isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "dry_run": args.dry_run,
+        "rows_total": len(leads),
+        "rows_enriched": enriched,
+        "rows_flagged_for_review": notes,
+        "rows_errored": errored,
+        "field_fill_before": field_fill_before,
+        "field_fill_after": field_fill_after,
+        "errors": errors,
+        "airtable": airtable_result,
+    }
+    summary_path = args.output.with_suffix(".summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"-> {summary_path} (machine-readable run summary for Hermes)")
+
+    # Non-zero exit on partial failure — the CSV/Airtable push still completed
+    # for every other row, but an orchestrator (Hermes) should know something
+    # needs attention rather than silently treating this as a clean run.
+    if errored:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
