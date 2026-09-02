@@ -130,6 +130,7 @@ TARGET_FIELDS = [
     "first_name", "last_name", "business_name", "phone", "email",
     "linkedin", "website", "address", "categories", "description",
     "rating", "review_count", "social_links", "website_score", "source",
+    "enrichment_notes",
 ]
 
 
@@ -815,11 +816,22 @@ def airtable_push(rows, table_name, dry_run=False):
 # ---------------------------------------------------------------------------
 
 def _target_snapshot(lead):
-    """Only the fields that actually end up in the CSV/Airtable — used to decide
-    whether a row was really enriched, as opposed to just picking up an
-    _enrichment_notes entry (e.g. mazenod's blanket "not enrichable" note,
-    or an error note), which isn't the same thing."""
+    """The real enrichment fields only (excludes enrichment_notes, which isn't
+    a dataclass field — see _output_row) — used to decide whether a row was
+    really enriched, as opposed to just picking up an _enrichment_notes entry
+    (e.g. mazenod's blanket "not enrichable" note, or an error note), which
+    isn't the same thing. Also the basis for the run summary's fill counts."""
     return {k: v for k, v in asdict(lead).items() if k in TARGET_FIELDS}
+
+
+def _output_row(lead):
+    """What actually gets written to the CSV/Airtable: the target fields plus
+    a human-readable enrichment_notes column, so a row flagged for manual
+    review (free-scrape guess, failed verification, enrichment error, ...) is
+    visible as exactly that in Airtable — not only in the run's summary.json."""
+    row = _target_snapshot(lead)
+    row["enrichment_notes"] = "; ".join(lead._enrichment_notes)
+    return row
 
 
 def _field_fill_counts(leads):
@@ -900,11 +912,11 @@ def main():
                 enriched += 1
             if lead._enrichment_notes:
                 notes += 1
-            writer.writerow(_target_snapshot(lead))
+            writer.writerow(_output_row(lead))
             f.flush()
 
     field_fill_after = _field_fill_counts(leads)
-    rows_for_output = [_target_snapshot(lead) for lead in leads]
+    rows_for_output = [_output_row(lead) for lead in leads]
 
     print(
         f"{args.source}: {len(leads)} rows processed, {enriched} enriched, "
