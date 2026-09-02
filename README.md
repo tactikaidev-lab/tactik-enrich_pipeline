@@ -88,15 +88,22 @@ git pull && docker compose build
 
 ## 4. Give Hermes the invocation
 
-Hermes already has terminal access — no API server needed. Either as a
-one-off chat command or a skill/cron entry, the exact command it runs from
-the deployed repo directory is:
+Hermes already has terminal access — no API server needed. Rather than
+having it remember the full `docker compose run` invocation (flag names,
+output paths, exact Airtable table names), point it at `bin/enrich`, which
+wraps all of that:
 
 ```bash
-docker compose run --rm enrich \
-  --source <source> --input /data/<file> --output /data/<source>_enriched.csv \
-  --airtable-push --airtable-table "Leads - <Source Name>"
+bin/enrich <source> <input-file> --push
 ```
+
+e.g. `bin/enrich vsbn vsbn_final.xlsx --push`. It validates the source name,
+resolves the input file into `./data` (copying it in if it's sent from
+somewhere else — e.g. a Telegram upload saved elsewhere first), derives the
+output filename and the Airtable table name automatically, and exits
+non-zero if any row errored. Always validate with `--dry-run --limit 20`
+first — same rule as everywhere else. Run `bin/enrich --help` for the full
+flag list (`--limit`, `--table` to override the Airtable table, `--smtp-verify`).
 
 Document this exact command in the Obsidian vault (per the "architecture
 before deployment" rule) alongside whichever Hermes skill/cron entry calls

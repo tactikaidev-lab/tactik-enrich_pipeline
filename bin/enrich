@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# bin/enrich — the one command Hermes needs to know for this pipeline.
+# Wraps `docker compose run` so Hermes never has to remember flag names,
+# output paths, or exact Airtable table names — just a source and a file.
+#
+# Run `bin/enrich --help` for usage. Must be run from (or as) the repo root
+# — it cd's there itself, so an absolute path to this script also works.
+
+set -euo pipefail
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: bin/enrich <source> <input-file> [options]
+
+  <source>       fresh | mazenod | transcend | vsbn | bali
+  <input-file>   a filename already in ./data, or any path on this host —
+                 if it isn't in ./data yet, it's copied in automatically
+
+Options:
+  --dry-run        validate only — no paid API calls, no Airtable push
+  --limit N        process only the first N rows (use this before a full run)
+  --push           push the enriched rows into Airtable when done (table
+                    name is picked automatically from <source> — see below,
+                    or override with --table)
+  --table NAME     Airtable table name to use with --push, instead of the
+                    automatic one
+  --smtp-verify    opt-in free-tier coverage boost, vsbn/transcend only —
+                    read enrich_pipeline.py's module docstring before using
+  -h, --help       show this help
+
+Examples:
+  bin/enrich vsbn vsbn_final.xlsx --dry-run --limit 20
+  bin/enrich vsbn vsbn_final.xlsx --push
+
+Output:
+  ./data/<source>_enriched.csv
+  ./data/<source>_enriched.summary.json   <- the real, machine-readable result
+
+Exit code is non-zero if any row errored during enrichment (same signal
+enrich_pipeline.py already gives — this script just passes it through).
+EOF
+}
+
+VALID_SOURCES="fresh mazenod transcend vsbn bali"
+
+# Default Airtable table per source — override per-run with --table if a
+# different name is ever needed. A case statement rather than an associative
+# array on purpose: associative arrays need bash 4+, and macOS still ships
+# bash 3.2 by default, so this stays portable to whatever's actually running
+# this script.
+airtable_table_for() {
+  case "$1" in
+    fresh)     echo "Leads - Fresh Networking" ;;
+    mazenod)   echo "Leads - Mazenod Alumni" ;;
+    transcend) echo "Leads - Transcend" ;;
+    vsbn)      echo "Leads - VSBN" ;;
+    bali)      echo "Leads - Bali WhatsApp" ;;
+  esac
+}
+
+if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
+  usage
+  [[ $# -eq 0 ]] && exit 1 || exit 0
+fi
+
+if [[ $# -lt 2 ]]; then
+  echo "error: need both <source> and <input-file>" >&2
+  usage
+  exit 1
+fi
+
+SOURCE="$1"; shift
+INPUT_ARG="$1"; shift
+
+if [[ ! " $VALID_SOURCES " == *" $SOURCE "* ]]; then
+  echo "error: unknown source '$SOURCE' — must be one of: $VALID_SOURCES" >&2
+  exit 1
+fi
+
+DRY_RUN=0
+LIMIT=""
+PUSH=0
+SMTP_VERIFY=0
+TABLE_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --limit) LIMIT="${2:-}"; [[ -z "$LIMIT" ]] && { echo "error: --limit needs a number" >&2; exit 1; }; shift 2 ;;
+    --push) PUSH=1; shift ;;
+    --table) TABLE_OVERRIDE="${2:-}"; shift 2 ;;
+    --smtp-verify) SMTP_VERIFY=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown option '$1'" >&2; usage; exit 1 ;;
+  esac
+done
+
+mkdir -p data
+
+# Resolve the input file into ./data — copy it in if it isn't there yet, so
+# it's visible inside the container at /data regardless of where it started.
+if [[ -f "data/$INPUT_ARG" ]]; then
+  IN_FILE="$INPUT_ARG"
+elif [[ -f "$INPUT_ARG" ]]; then
+  IN_FILE="$(basename "$INPUT_ARG")"
+  cp "$INPUT_ARG" "data/$IN_FILE"
+else
+  echo "error: input file not found (checked ./data/$INPUT_ARG and $INPUT_ARG)" >&2
+  exit 1
+fi
+
+OUT_CSV="${SOURCE}_enriched.csv"
+
+ARGS=(--source "$SOURCE" --input "/data/$IN_FILE" --output "/data/$OUT_CSV")
+[[ $DRY_RUN -eq 1 ]] && ARGS+=(--dry-run)
+[[ -n "$LIMIT" ]] && ARGS+=(--limit "$LIMIT")
+[[ $SMTP_VERIFY -eq 1 ]] && ARGS+=(--smtp-verify)
+if [[ $PUSH -eq 1 ]]; then
+  TABLE="${TABLE_OVERRIDE:-$(airtable_table_for "$SOURCE")}"
+  ARGS+=(--airtable-push --airtable-table "$TABLE")
+fi
+
+echo ">> docker compose run --rm enrich ${ARGS[*]}"
+echo
+set +e
+docker compose run --rm enrich "${ARGS[@]}"
+EXIT_CODE=$?
+set -e
+
+echo
+echo "Full machine-readable result: data/${SOURCE}_enriched.summary.json"
+exit "$EXIT_CODE"
