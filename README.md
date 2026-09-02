@@ -109,6 +109,65 @@ Document this exact command in the Obsidian vault (per the "architecture
 before deployment" rule) alongside whichever Hermes skill/cron entry calls
 it, so it's not just known to you.
 
+## 5. The MCP server — calling this directly from Claude, no Hermes involved
+
+`bin/enrich` is for Hermes. For asking Claude directly ("enrich this list")
+from your own Claude account and your boss's, separately, there's a second,
+long-running service: `mcp_server/app.py`. Full mechanics (the upload flow,
+why it's shaped the way it is, auth) are in that file's module docstring —
+this section is just the setup steps, once per requirement below.
+
+**a) Generate secrets and start the server**
+
+```bash
+# Two DIFFERENT random secrets — don't reuse one for both:
+openssl rand -hex 32   # -> MCP_BEARER_TOKEN
+openssl rand -hex 32   # -> MCP_UPLOAD_SECRET
+```
+
+Add those plus `MCP_PUBLIC_BASE_URL` (next step) to `.env`, then:
+
+```bash
+docker compose up -d mcp
+docker compose logs -f mcp   # confirm "Application startup complete"
+```
+
+This one you `up`, not `run --rm` — it stays running, `restart: unless-stopped`.
+
+**b) Get a public HTTPS URL — Tailscale Funnel**
+
+The server binds to `127.0.0.1:8420` only; Funnel is what actually exposes
+it publicly with a real TLS cert, no port-forwarding or domain purchase:
+
+```bash
+sudo tailscale funnel 8420
+```
+
+This prints the public URL (`https://<machine-name>.<tailnet>.ts.net`).
+Put that exact URL (no trailing slash) into `.env` as `MCP_PUBLIC_BASE_URL`,
+then `docker compose restart mcp` so it picks up the new value — the
+upload URLs `request_upload` hands out are built from this, so it has to be
+right before anyone tries to attach a file. `tailscale funnel status` shows
+what's currently exposed; `tailscale funnel 8420 off` turns it back off.
+
+**c) Add the connector — once per Claude account (yours, then your boss's)**
+
+1. claude.ai → Settings → Connectors → Add custom connector.
+2. URL: `<MCP_PUBLIC_BASE_URL>/mcp`
+3. Under its credential/auth setup, paste `MCP_BEARER_TOKEN` as the token —
+   this is a static shared secret, not an OAuth login.
+4. To actually attach files (not just enrich ones already on the server):
+   Settings → Capabilities → Code execution and file creation → turn it on
+   → Additional allowed domains → add the host from `MCP_PUBLIC_BASE_URL`
+   (just the domain, e.g. `<machine-name>.<tailnet>.ts.net`, no scheme).
+   Skip this if you'll only ever reference files already sitting in `/data`.
+
+**d) Try it**
+
+In a chat on either account: *"List the lead sources you can enrich"* should
+call `list_sources()`. Attach a small test file and say *"enrich this,
+dry run, limit 5"* to exercise the full upload path before anything real.
+
 ## Notes
 
 - Mazenod is intentionally *not* enriched by API calls — confirmed not viable

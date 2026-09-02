@@ -1,9 +1,17 @@
-# This is a one-shot job, not a long-running server — there's nothing to
-# `docker compose up`. Compose here just gives you a repeatable build + run
-# config instead of retyping `docker build` / `docker run` flags by hand.
+# Two services, one image (see Dockerfile):
 #
-# Build:  docker compose build
-# Run:    docker compose run --rm enrich --source vsbn --input /data/vsbn_final.xlsx --output /data/vsbn_enriched.csv --limit 20
+# `enrich` — one-shot job, not a server. Nothing to `up` here.
+#   Build:  docker compose build
+#   Run:    docker compose run --rm enrich --source vsbn --input /data/vsbn_final.xlsx --output /data/vsbn_enriched.csv --limit 20
+#   (bin/enrich wraps this so Hermes never has to remember the flags — see README.)
+#
+# `mcp` — long-running MCP server for direct use from Claude (yours and your
+#   boss's separate accounts), instead of through Hermes. This one you DO
+#   `up`. Requires MCP_BEARER_TOKEN / MCP_UPLOAD_SECRET / MCP_PUBLIC_BASE_URL
+#   in .env — see .env.example and mcp_server/app.py's module docstring for
+#   what these are and the connector setup steps in each Claude account.
+#   Start:  docker compose up -d mcp
+#   Logs:   docker compose logs -f mcp
 #
 # Same config on the production host — see README.md for the full deploy flow.
 
@@ -14,3 +22,17 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+
+  mcp:
+    build: .
+    image: tactik-lead-enrichment
+    env_file: .env
+    entrypoint: ["python", "/app/mcp_server/app.py"]
+    ports:
+      - "127.0.0.1:8420:8420"  # bind to localhost only — Tailscale Funnel (or
+                                 # your own reverse proxy) is what actually
+                                 # exposes this publicly, not a raw port
+                                 # forward. See README for the Funnel command.
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
